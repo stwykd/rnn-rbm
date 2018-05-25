@@ -93,25 +93,57 @@ epochs = 100
 
 
 
-def load_datasets(dataset_paths):
-    """Load and encode all midi files from each dataset in `dataset_paths`
+def load_and_preprocess_datasets(dataset_paths):
+    """Load, preprocess and encode all midi files from each dataset in `dataset_paths`
     :param dataset_paths: List of dataset folders to load from
     :return: List of encoded songs
     """
     songs = []
     for path in dataset_paths:
-        dataset_songs = []  # Songs from the current dataset
-        for f in tqdm(glob(path+'/*.mid')):
-            try:
-                song = reshape_with_timesteps(np.array(midiToNoteStateMatrix(f)))
-                if np.array(song).shape[0] > 50/timesteps:
-                    dataset_songs.append(song)
-            except Exception as e:
-                print e
+        pickle_filename = 'datasets/{}.pickle'.format(path.split('/')[-1])
+
+        if os.path.exists(pickle_filename):
+            print "Loading {} from pickle ...".format(path)
+            with open(pickle_filename, 'rb') as f:
+                dataset_songs = pickle.load(f)
+        else:
+            print "Preprocessing {}".format(path)
+            # Preprocess songs and save preprocessed songs to midi
+            for midi_file in tqdm(glob(path+'/*.mid')):
+                s = converter.parse(midi_file)
+                prep_s = preprocess_score(s)
+
+                split_midifile = midi_file.split('/')
+                prep_folder, prep_filename = 'preprocessed/'+split_midifile[-2], split_midifile[-1]
+                prep_filepath = prep_folder+'/'+prep_filename
+
+                if not os.path.exists(prep_folder):
+                    os.makedirs(prep_folder)
+
+                prep_s.write('midi', fp=prep_filepath)
+
+
+            dataset_songs = []  # Songs from the current dataset
+
+            print "Loading preprocessed songs from {}".format(path)
+            # Load preprocessed scores and save to pickle
+            for midi_file in tqdm(glob(path+'/*.mid')):
+                try:
+                    song = reshape_with_timesteps(np.array(midiToNoteStateMatrix(midi_file)))
+                    if np.array(song).shape[0] > 50/timesteps:
+                        dataset_songs.append(song)
+                except Exception as e:
+                    print e
+
+            print "Saving {} to pickle".format(path)
+            with open(pickle_filename, 'wb') as f:
+                pickle.dump(songs, f)
+
         songs.extend(dataset_songs)
 
     # Force garbage collection (i.e. Release unreferenced memory)
     gc.collect()
+
     return songs
 
 
@@ -297,178 +329,83 @@ def reshape_with_timesteps(x):
 
 
 
-def run(dataset_paths, weights_filepath=None):
-    """
+
+def train(dataset_paths, weights_filepath=None):
+    """Train using all datasets in `datasets_paths`
+    If `weights_Filepath` is set, those weights are going to be restored before training
     :param dataset_paths: The path to all datasets used to train.
                           See datasets available in the `datasets/` folder
     :param weights_filepath: Path to weights saved from previous training session
     """
+
+    u_t = tf.scan(RNN_forw, x, initializer=u0)
+
+    bh_t = tf.reshape(tf.scan(RNN_to_RBM_hidd, u_t, tf.zeros([1, n_hidden], tf.float32)), [batch_size, n_hidden])
+    bv_t = tf.reshape(tf.scan(RNN_to_RBM_vis, u_t, tf.zeros([1, n_visible], tf.float32)), [batch_size, n_visible])
 
     print 'Loading datasets ...'
-    songs = load_datasets(dataset_paths)
+    songs = load_and_preprocess_datasets(dataset_paths)
 
     saver = tf.train.Saver([W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
 
-    # Load saved weights and compose music (without training)
     if weights_filepath:
-        print 'Composing ...'
-
-        from random import choice
-        primer_path = choice(glob(dataset_paths+'*.mid'))
-        primer = reshape_with_timesteps(np.array(midiToNoteStateMatrix(primer_path)))
-
+        print "Restoring saved weights ..."
         with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
             saver.restore(sess, weights_filepath)
 
-            # Prime the RNN-RBM to compose a song
-            out = sess.run(compose(250), feed_dict={x: primer})
-
-            # Write the song to midi
-            out = np.reshape(out, (out.shape[0]*timesteps, 2*span))
-            noteStateMatrixToMidi(out, name='compositions/out_'+primer_path.split('/')[-1])
 
 
+    optimizer = tf.train.GradientDescentOptimizer(learning_rate=lr)
+    gradients = optimizer.compute_gradients(free_energy_cost(x, W, bv_t, bh_t, 15), [W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
 
-    # Train and save trained weights after training
-    else:
-        print 'Training ...'
+    # Clip gradients to avoid exploding gradients (a common problem with RNNs)
+    gradients = [(tf.clip_by_value(grad, -5.0, 5.0), hyperpar) for grad, hyperpar in gradients]
 
-        u_t = tf.scan(RNN_forw, x, initializer=u0)
+    logs_dir = './graphs'
+    with tf.Session() as sess:
+        writer = tf.summary.FileWriter(logs_dir, sess.graph)
 
-        bh_t = tf.reshape(tf.scan(RNN_to_RBM_hidd, u_t, tf.zeros([1, n_hidden], tf.float32)), [batch_size, n_hidden])
-        bv_t = tf.reshape(tf.scan(RNN_to_RBM_vis, u_t, tf.zeros([1, n_visible], tf.float32)), [batch_size, n_visible])
+        sess = initialise_variables(songs, sess)
 
-        optimizer = tf.train.GradientDescentOptimizer(learning_rate=lr)
-        gradients = optimizer.compute_gradients(free_energy_cost(x, W, bv_t, bh_t, 15), [W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
+        print "Training ..."
+        for epoch in range(epochs):
+            loss_epoch = 0  # Loss for the current epoch
+            for song in tqdm(songs):
+                for i in range(1, len(song), batch_size_):
+                    _, cost = sess.run([optimizer.apply_gradients(gradients), free_energy_cost(x, W, bv_t, bh_t, 15)],
+                                       feed_dict={x: song[i:i + batch_size_], lr: lr_ if epoch <= 10 else lr_/(epoch-10)})
+                    loss_epoch += abs(cost)
+            print '\nloss', loss_epoch/len(songs), 'at epoch', epoch
 
-        # Clip gradients to avoid exploding gradients (a common problem with RNNs)
-        gradients = [(tf.clip_by_value(grad, -5.0, 5.0), hyperpar) for grad, hyperpar in gradients]
+            # Save the RNN-RBM state for the current epoch
+            saver.save(sess, "checkpoints/{}_{}.ckpt".format(epoch, loss_epoch))
 
-        with tf.Session() as sess:
-            sess = initialise_variables(songs, sess)
-
-            for epoch in range(epochs):
-                loss_epoch = 0  # Loss for the current epoch
-                for song in tqdm(songs):
-                    for i in range(1, len(song), batch_size_):
-                        _, cost = sess.run([optimizer.apply_gradients(gradients), free_energy_cost(x, W, bv_t, bh_t, 15)],
-                                           feed_dict={x: song[i:i + batch_size_], lr: lr_ if epoch <= 10 else lr_/(epoch-10)})
-                        loss_epoch += abs(cost)
-                print '\nloss', loss_epoch/len(songs), 'at epoch', epoch
-                # Save the RNN-RBM state for the current epoch
-                save_path = saver.save(sess, "checkpoints/{}_{}.ckpt".format(epoch, loss_epoch))
+    writer.close()
 
 
-# TODO Recently extended from `run(...)` to allow preprocessing and pickling but yet to properly test
-def run_with_preprocessing(dataset_paths, weights_filepath=None):
-    """
-    :param dataset_paths: The path to all datasets used to train.
-                          See datasets available in the `datasets/` folder
+def generate(dataset_paths, weights_filepath, n_timesteps=200):
+    """Generate a score `n_timesteps` long using weights restored from `weights_filepath`
     :param weights_filepath: Path to weights saved from previous training session
+    :param n_timesteps: Number of timesteps for the generated score
     """
-
-    songs = []
-    for path in dataset_paths:
-        pickle_filename = 'datasets/{}.pickle'.format(path.split('/')[-1])
-
-        if os.path.exists(pickle_filename):
-            print "Loading {} from pickle ...".format(path)
-            with open(pickle_filename, 'rb') as f:
-                dataset_songs = pickle.load(f)
-        else:
-            print "Preprocessing {}".format(path)
-            # Preprocess songs and save preprocessed songs to midi
-            for midi_file in tqdm(glob(path+'/*.mid')):
-                s = converter.parse(midi_file)
-                prep_s = preprocess_score(s)
-                print midi_file
-                split_midifile = midi_file.split('/')
-                prep_folder, prep_filename = 'preprocessed/'+split_midifile[-2], split_midifile[-1]
-                prep_filepath = prep_folder+'/'+prep_filename
-
-                if not os.path.exists(prep_folder):
-                    os.makedirs(prep_folder)
-
-                prep_s.write('midi', fp=prep_filepath)
-
-
-            dataset_songs = []  # Songs from the current dataset
-
-            print "Loading preprocessed songs from {}".format(path)
-            # Load preprocessed scores and save to pickle
-            for midi_file in tqdm(glob(path+'/*.mid')):
-                try:
-                    song = reshape_with_timesteps(np.array(midiToNoteStateMatrix(midi_file)))
-                    if np.array(song).shape[0] > 50/timesteps:
-                        dataset_songs.append(song)
-                except Exception as e:
-                    print e
-
-            print "Saving {} to pickle".format(path)
-            with open(pickle_filename, 'wb') as f:
-                pickle.dump(songs, f)
-
-        songs.extend(dataset_songs)
-
-
-
     saver = tf.train.Saver([W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
 
-    # Load saved weights and compose music (without training)
-    if weights_filepath:
-        print 'Composing ...'
+    import random
+    rand_dataset_path = dataset_paths[random.randint(0, len(dataset_paths)-1)]
+    primer_path = random.choice(glob(rand_dataset_path+'/*.mid'))
+    primer = reshape_with_timesteps(np.array(midiToNoteStateMatrix(primer_path)))
 
-        from random import choice
-        primer_path = choice(glob(dataset_paths+'*.mid'))
-        primer = reshape_with_timesteps(np.array(midiToNoteStateMatrix(primer_path)))
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, weights_filepath)
 
-        with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
-            saver.restore(sess, weights_filepath)
+        # Prime the RNN-RBM to compose a song
+        out = sess.run(compose(n_timesteps), feed_dict={x: primer})
 
-            # Prime the RNN-RBM to compose a song
-            out = sess.run(compose(250), feed_dict={x: primer})
-
-            # Write the song to midi
-            out = np.reshape(out, (out.shape[0]*timesteps, 2*span))
-            noteStateMatrixToMidi(out, name='compositions/out_'+primer_path.split('/')[-1])
+        # Write the song to midi
+        out = np.reshape(out, (out.shape[0]*timesteps, 2*span))
+        noteStateMatrixToMidi(out, name='compositions/out_'+primer_path.split('/')[-1])
 
 
 
-    # Train and save trained weights after training
-    else:
-        print 'Training ...'
-
-        u_t = tf.scan(RNN_forw, x, initializer=u0)
-
-        bh_t = tf.reshape(tf.scan(RNN_to_RBM_hidd, u_t, tf.zeros([1, n_hidden], tf.float32)), [batch_size, n_hidden])
-        bv_t = tf.reshape(tf.scan(RNN_to_RBM_vis, u_t, tf.zeros([1, n_visible], tf.float32)), [batch_size, n_visible])
-
-        optimizer = tf.train.GradientDescentOptimizer(learning_rate=lr)
-        gradients = optimizer.compute_gradients(free_energy_cost(x, W, bv_t, bh_t, 15), [W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
-
-        # Clip gradients to avoid exploding gradients (a common problem with RNNs)
-        gradients = [(tf.clip_by_value(grad, -5.0, 5.0), hyperpar) for grad, hyperpar in gradients]
-
-        with tf.Session() as sess:
-            sess = initialise_variables(songs, sess)
-
-            for epoch in range(epochs):
-                loss_epoch = 0  # Loss for the current epoch
-                for song in tqdm(songs):
-                    for i in range(1, len(song), batch_size_):
-                        _, cost = sess.run([optimizer.apply_gradients(gradients), free_energy_cost(x, W, bv_t, bh_t, 15)],
-                                           feed_dict={x: song[i:i + batch_size_], lr: lr_ if epoch <= 10 else lr_/(epoch-10)})
-                        loss_epoch += abs(cost)
-
-                print '\nloss', loss_epoch/len(songs), 'at epoch', epoch
-
-                # Save the RNN-RBM state for the current epoch
-                saver.save(sess, "checkpoints/{}_{}.ckpt".format(epoch, loss_epoch))
-
-
-
-
-#run(['datasets/Piano-midi.de'])
-run(['datasets/ff'])
+train(['datasets/ff'], 'checkpoints/5_7584.02737855.ckpt')
