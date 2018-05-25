@@ -6,9 +6,10 @@ from six.moves import cPickle as pickle
 from music21 import *
 from glob import glob
 import os
+import gc
 
 
-### RNN-RBM hyperparameters ###
+# RNN-RBM hyperparameters
 
 timesteps = 5
 # RBM visible layer size. At each timestep, the input vector will be of size 2*span
@@ -44,26 +45,26 @@ lr_ = 0.01
 # Refer to this image for the RNN-RBM architecture http://deeplearning.net/tutorial/_images/rnnrbm.png
 
 # Placeholder for input vector `x`
-x  = tf.placeholder(tf.float32, [None, n_visible], name="x")
+x = tf.placeholder(tf.float32, [None, n_visible], name="x")
 # Weights for the RBM
 W = tf.Variable(tf.random_normal([n_visible, n_hidden], 0.01), name="W")
 # Weights from RNN hidden layer at timestep t-1 to RBM hidden layer at timestep t
 Wuh = tf.Variable(tf.random_normal([n_hidden_recurrent, n_hidden], 0.0001), name="Wuh")
 # Bias from RNN hidden layer at timestep t-1 to RBM hidden layer at timestep t
-bh  = tf.Variable(tf.zeros([1, n_hidden], tf.float32), name="bh")
+bh = tf.Variable(tf.zeros([1, n_hidden], tf.float32), name="bh")
 # Weights from RNN hidden layer at timestep t-1 to RBM visible layer at timestep t
 Wuv = tf.Variable(tf.random_normal([n_hidden_recurrent, n_visible], 0.0001), name="Wuv")
 # Bias from RNN hidden layer at timestep t-1 to RBM visible layer at timestep t
-bv  = tf.Variable(tf.zeros([1, n_visible], tf.float32), name="bv")
+bv = tf.Variable(tf.zeros([1, n_visible], tf.float32), name="bv")
 # Weights from RBM visible layer at timestep t to RNN hidden layer at timestep t
 Wvu = tf.Variable(tf.random_normal([n_visible, n_hidden_recurrent], 0.0001), name="Wvu")
 # Weights from RNN hidden layer at timestep t-1 to RNN hidden layer at timestep t
 Wuu = tf.Variable(tf.random_normal([n_hidden_recurrent, n_hidden_recurrent], 0.0001), name="Wuu")
 # Bias from RNN hidden layer at timestep t-1 to RNN hidden layer at timestep t
-bu  = tf.Variable(tf.zeros([1, n_hidden_recurrent],  tf.float32), name="bu")
+bu = tf.Variable(tf.zeros([1, n_hidden_recurrent],  tf.float32), name="bu")
 
 # Initial RNN state
-u0  = tf.Variable(tf.zeros([1, n_hidden_recurrent], tf.float32), name="u0")
+u0 = tf.Variable(tf.zeros([1, n_hidden_recurrent], tf.float32), name="u0")
 
 
 # Bias from visible layer to hidden layer for RBM at timestep t
@@ -89,6 +90,29 @@ bh_t = tf.reshape(tf.scan(RNN_to_RBM_hidd, u_t, tf.zeros([1, n_hidden], tf.float
 
 epochs = 100
 
+
+
+
+def load_datasets(dataset_paths):
+    """Load and encode all midi files from each dataset in `dataset_paths`
+    :param dataset_paths: List of dataset folders to load from
+    :return: List of encoded songs
+    """
+    songs = []
+    for path in dataset_paths:
+        dataset_songs = []  # Songs from the current dataset
+        for f in tqdm(glob(path+'/*.mid')):
+            try:
+                song = reshape_with_timesteps(np.array(midiToNoteStateMatrix(f)))
+                if np.array(song).shape[0] > 50/timesteps:
+                    dataset_songs.append(song)
+            except Exception as e:
+                print e
+        songs.extend(dataset_songs)
+
+    # Force garbage collection (i.e. Release unreferenced memory)
+    gc.collect()
+    return songs
 
 
 def preprocess_score(s, instr=None):
@@ -243,7 +267,7 @@ def compose(n_timesteps, prime_timesteps=80):
         x_out = gibbs_sample(primer, W, bv_t, bh_t, k=25)
 
         # Propagate through the RNN using the current output `x_out` and the RNN hidden layer at t-1, `prev_t`
-        u_t  = (tf.tanh(bu + tf.matmul(x_out, Wvu) + tf.matmul(prev_t, Wuu)))
+        u_t = (tf.tanh(bu + tf.matmul(x_out, Wvu) + tf.matmul(prev_t, Wuu)))
 
         # Append `x_out` to the predicted song `pred`
         pred = tf.concat(values=[pred, x_out], axis=0)
@@ -281,17 +305,8 @@ def run(dataset_paths, weights_filepath=None):
     """
 
     print 'Loading datasets ...'
-    songs = []
-    for path in dataset_paths:
-        dataset_songs = []  # Songs from the current dataset
-        for f in tqdm(glob(path+'/*.mid')):
-            try:
-                song = reshape_with_timesteps(np.array(midiToNoteStateMatrix(f)))
-                if np.array(song).shape[0] > 50/timesteps:
-                    dataset_songs.append(song)
-            except Exception as e:
-                print e
-        songs.extend(dataset_songs)
+    songs = load_datasets(dataset_paths)
+
     saver = tf.train.Saver([W, Wuh, Wuv, Wvu, Wuu, bh, bv, bu, u0])
 
     # Load saved weights and compose music (without training)
@@ -446,9 +461,11 @@ def run_with_preprocessing(dataset_paths, weights_filepath=None):
                         _, cost = sess.run([optimizer.apply_gradients(gradients), free_energy_cost(x, W, bv_t, bh_t, 15)],
                                            feed_dict={x: song[i:i + batch_size_], lr: lr_ if epoch <= 10 else lr_/(epoch-10)})
                         loss_epoch += abs(cost)
+
                 print '\nloss', loss_epoch/len(songs), 'at epoch', epoch
+
                 # Save the RNN-RBM state for the current epoch
-                save_path = saver.save(sess, "checkpoints/{}_{}.ckpt".format(epoch, loss_epoch))
+                saver.save(sess, "checkpoints/{}_{}.ckpt".format(epoch, loss_epoch))
 
 
 
