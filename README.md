@@ -1,6 +1,6 @@
 # RNN-RBM
 
-Implementation of the RNN-RBM architecture introduced in [this](http://www-etud.iro.umontreal.ca/~boulanni/ICML2012.pdf) paper.
+Implementation of an RNN-RBM for music compostion. The model was inspired by [this](http://www-etud.iro.umontreal.ca/~boulanni/ICML2012.pdf) paper.
 
 The RNN-RBM mixes the capability of the RNN of learning temporal dependecies, with the capability of the RBM to learn a probability distribution over the training dataset (being a generative model). It is comprised of a RNN, where each recurrent hidden layer is connected to a different RBM.
 
